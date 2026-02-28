@@ -15,9 +15,10 @@ from einops import repeat
 from diff_gaussian_rasterization import GaussianRasterizer
 from diff_gaussian_rasterization import GaussianRasterizationSettings
 
-from gaussian_splatting.scene.gaussian_model import GaussianModel
-from gaussian_splatting.utils.ref_utils import reflect
-from gaussian_splatting.utils.general_utils import get_minimum_axis, flip_align_view
+from scene.gaussian_model import GaussianModel
+from utils.ref_utils import reflect
+from utils.general_utils import get_minimum_axis, flip_align_view
+import torch.nn.functional as F 
 
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
                               visible_mask=None, is_training=False,
@@ -29,6 +30,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     offsets = grid_offsets.view([-1, 3]) # [mask]
+    center_normal = -torch.mean(grid_offsets, dim=1)
     grid_scaling = pc.get_scaling[visible_mask]
 
     ## get view properties for anchor
@@ -82,28 +84,95 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
 
     # local_feature = cat_local_view
     # concatenate and filter by mask
+    # 先定义各固定维度（避免魔法数字）
+    FEAT_DIM = 32
+    GRID_SCALING_DIM = 6
+    ANCHOR_DIM = 3
+    NORMAL_DIM = 3
+    COLOR_DIM = 3
+    SCALE_ROT_DIM = 7
+    OFFSETS_DIM = 3
+    TINT_DIM = 3
+    ROUGHNESS_DIM = 1
+    IDIV_DIM = 3
+
     if pc.enable_ref:
-        concatenated = torch.cat([local_feature, grid_scaling, anchor], dim=-1)
+        # concatenated: feat(32) + local_feature(pc.color_dim+pc.appearance_dim+1) + grid_scaling(6) + anchor(3) + center_normal(3)
+        concatenated = torch.cat([feat, local_feature, grid_scaling, anchor, center_normal], dim=-1)
         concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
+        # concatenated_all: concatenated_repeated + color(3) + scale_rot(7) + offsets(3) + tint(3) + roughness(1)
         concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, tint, roughness], dim=-1)
     else:
-        concatenated = torch.cat([grid_scaling, anchor], dim=-1)
+        # concatenated: grid_scaling(6) + anchor(3) + center_normal(3)
+        concatenated = torch.cat([grid_scaling, anchor, center_normal], dim=-1)
         concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
+        # concatenated_all: concatenated_repeated + color(3) + scale_rot(7) + offsets(3)
         concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    if pc.enable_idiv: # Concatenate IDIV
+
+    if pc.enable_idiv: # 拼接IDIV(3)
         concatenated_all = torch.cat([concatenated_all, idiv], dim=-1)
+
     masked = concatenated_all[mask]
     opacity = neural_opacity[mask]
 
-    # split attributes
+    # 核心修正：按拼接顺序精准拆分维度
     if pc.enable_idiv and pc.enable_ref:
-        features, scaling_repeat, repeat_anchor, color, scale_rot, offsets, tint, roughness, idiv = masked.split([pc.color_dim+pc.appearance_dim + 1, 6, 3, 3, 7, 3, 3, 1, 3], dim=-1)
+        # 拆分顺序：feat_repeat(32) + local_feature(pc.color_dim+pc.appearance_dim+1) + grid_scaling(6) + repeat_anchor(3) + repeat_normal(3) + color(3) + scale_rot(7) + offsets(3) + tint(3) + roughness(1) + idiv(3)
+        split_dims = [
+            FEAT_DIM,  # feat_repeat: 32
+            pc.color_dim + pc.appearance_dim + 1,  # local_feature (features)
+            GRID_SCALING_DIM,  # scaling_repeat: 6
+            ANCHOR_DIM,  # repeat_anchor: 3
+            NORMAL_DIM,  # repeat_normal: 3
+            COLOR_DIM,  # color: 3
+            SCALE_ROT_DIM,  # scale_rot:7
+            OFFSETS_DIM,  # offsets:3
+            TINT_DIM,  # tint:3
+            ROUGHNESS_DIM,  # roughness:1
+            IDIV_DIM  # idiv:3
+        ]
+        feat_repeat, features, scaling_repeat, repeat_anchor, repeat_normal, color, scale_rot, offsets, tint, roughness, idiv = masked.split(split_dims, dim=-1)
+
     elif pc.enable_ref:
-        features, scaling_repeat, repeat_anchor, color, scale_rot, offsets, tint, roughness = masked.split([pc.color_dim+pc.appearance_dim + 1, 6, 3, 3, 7, 3, 3, 1], dim=-1)
+        # 拆分顺序：feat_repeat(32) + local_feature(pc.color_dim+pc.appearance_dim+1) + grid_scaling(6) + repeat_anchor(3) + repeat_normal(3) + color(3) + scale_rot(7) + offsets(3) + tint(3) + roughness(1)
+        split_dims = [
+            FEAT_DIM,
+            pc.color_dim + pc.appearance_dim + 1,
+            GRID_SCALING_DIM,
+            ANCHOR_DIM,
+            NORMAL_DIM,
+            COLOR_DIM,
+            SCALE_ROT_DIM,
+            OFFSETS_DIM,
+            TINT_DIM,
+            ROUGHNESS_DIM
+        ]
+        feat_repeat, features, scaling_repeat, repeat_anchor, repeat_normal, color, scale_rot, offsets, tint, roughness = masked.split(split_dims, dim=-1)
+
     elif pc.enable_idiv:
-        scaling_repeat, repeat_anchor, color, scale_rot, offsets, idiv = masked.split([6, 3, 3, 7, 3, 3], dim=-1)
+        # 拆分顺序：grid_scaling(6) + repeat_anchor(3) + repeat_normal(3) + color(3) + scale_rot(7) + offsets(3) + idiv(3)
+        split_dims = [
+            GRID_SCALING_DIM,
+            ANCHOR_DIM,
+            NORMAL_DIM,
+            COLOR_DIM,
+            SCALE_ROT_DIM,
+            OFFSETS_DIM,
+            IDIV_DIM
+        ]
+        scaling_repeat, repeat_anchor, repeat_normal, color, scale_rot, offsets, idiv = masked.split(split_dims, dim=-1)
+
     else:
-        scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+        # 拆分顺序：grid_scaling(6) + repeat_anchor(3) + repeat_normal(3) + color(3) + scale_rot(7) + offsets(3)
+        split_dims = [
+            GRID_SCALING_DIM,
+            ANCHOR_DIM,
+            NORMAL_DIM,
+            COLOR_DIM,
+            SCALE_ROT_DIM,
+            OFFSETS_DIM
+        ]
+        scaling_repeat, repeat_anchor, repeat_normal, color, scale_rot, offsets = masked.split(split_dims, dim=-1)
 
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
@@ -118,10 +187,13 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
     # repeat_view = repeat_view[mask]
     if render_n or pc.enable_ref or pc.enable_idiv:
         normal = get_minimum_axis(scaling, rot) # -1, 1; normalized. global, from object outwards
+        # nnormal = repeat_normal / (torch.norm(repeat_normal, dim=-1, keepdim=True) + 1e-8)
         dir_pp = xyz - viewpoint_camera.camera_center.repeat(xyz.shape[0], 1)
         dir_pp_normalized = (dir_pp / dir_pp.norm(dim=1, keepdim=True)).detach() # from camera to object
         normal, _ = flip_align_view(normal, dir_pp_normalized)
         dotprod = torch.sum(normal * -dir_pp_normalized, dim=-1, keepdims=True)
+
+        
         # normal = get_minimum_axis(scaling, rot) # -1, 1; normalized. global, from object outwards
         # normal, _ = flip_align_view(normal, repeat_view)
         # dotprod = torch.sum(normal * -repeat_view, dim=-1, keepdims=True)
@@ -141,7 +213,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
     diffuse_color = color # Original or Albedo
     if pc.enable_idiv:
         mid_val = torch.sum(idiv * normal, dim=-1, keepdims=True).abs()
-        diffuse_color = mid_val * diffuse_color
+        # if pc.enable_ref: # 只有开启高光分支时才有roughness
+        #     mid_val = mid_val * roughness  # 粗糙度越低，mid_val越弱
+        diffuse_color = mid_val* diffuse_color
+
 
     specular_color = 0
     if pc.enable_ref:
@@ -150,11 +225,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
         # reflect_dir = reflect(-repeat_view, normal)
         ide = pc.ide_fn(reflect_dir, roughness)
 
-        specular_color = pc.get_specular_mlp(torch.cat([ide, dotprod, features], dim=-1))
-        specular_color = specular_color.reshape([-1, 3])
-        specular_color = specular_color
+        # specular_color = pc.get_specular_mlp(torch.cat([ide, dotprod, features], dim=-1))
+        # specular_color = specular_color.reshape([-1, 3])
+        specular_color = pc.get_specular_mlp(feat_repeat, dir_pp_normalized, normal, ide)
+    
+    
+    final_color = specular_color + diffuse_color
 
-    out.update({"color": specular_color + diffuse_color})
+    out.update({"color": final_color})
     return out
 
 def render(viewpoint_camera, pc : GaussianModel, pipe,
