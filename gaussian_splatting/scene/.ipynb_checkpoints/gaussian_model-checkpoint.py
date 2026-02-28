@@ -24,9 +24,13 @@ from gaussian_splatting.utils.graphics_utils import BasicPointCloud
 from gaussian_splatting.utils.general_utils import strip_symmetric, build_scaling_rotation
 from gaussian_splatting.utils.ref_utils import generate_ide_fn
 from gaussian_splatting.scene.embedding import Embedding
+from gaussian_splatting.utils.spec_utils import AnchorSpecularNetwork
+
 
 TINT_ROUGH_SEP = True
 HYBRID_IMP_2 = False
+
+
 
 class GaussianModel:
 
@@ -110,7 +114,7 @@ class GaussianModel:
         self.update_hierachy_factor = update_hierachy_factor
         self.use_feat_bank = use_feat_bank
 
-        self.appearance_dim = 0
+        self.appearance_dim = appearance_dim
         self.embedding_appearance = None
         self.ratio = ratio
         self.add_opacity_dist = add_opacity_dist
@@ -211,14 +215,15 @@ class GaussianModel:
                     nn.Linear(feat_dim, 4*self.n_offsets),
                     nn.Softplus()
                 ).cuda()
-
+            ide_dim = 0
+            if self.deg_view == 4:
+                ide_dim = 38
+            elif self.deg_view == 5:
+                ide_dim = 72
+            else:
+                raise NotImplementedError('Only support IDE degree 4 or 5')
             # Inputs: feature (feat_dim + 3), n*view (1), IDE (38 or 72), others
-            self.mlp_specular = nn.Sequential(
-                nn.Linear(self.spec_dim+self.appearance_dim, feat_dim),
-                nn.ReLU(True),
-                nn.Linear(feat_dim, 3),
-                nn.Softplus()
-            ).cuda()
+            self.mlp_specular = AnchorSpecularNetwork(feature_dims=feat_dim,ide_dim=ide_dim).cuda()
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -988,8 +993,8 @@ class GaussianModel:
             self.prune_anchor(prune_mask)
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
-
-    def save_mlp_checkpoints(self, path, mode = 'unite'):#split or unite
+        
+    def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))
         if mode == 'split':
             self.mlp_opacity.eval()
@@ -1046,8 +1051,22 @@ class GaussianModel:
                 roughness_mlp.save(os.path.join(path, 'roughness_mlp.pt'))
                 self.mlp_roughness.train()
 
+                # 保留你原有的eval/train上下文，仅修正trace部分
                 self.mlp_specular.eval()
-                specular_mlp = torch.jit.trace(self.mlp_specular, (torch.rand(1, self.spec_dim+self.appearance_dim).cuda()))
+                # ========== 关键修正开始 ==========
+                # 1. 获取网络实际的维度参数（从mlp_specular实例中取，而非用错误的self.feat_dim+6）
+                asg_feature = self.mlp_specular.asg_feature  # 对应网络的feature_dims
+                ide_dim = self.mlp_specular.ide_dim          # 对应网络的ide_dim=72（默认）
+
+                # 2. 构造forward所需的全部4个参数（顺序必须和forward(x, view, normal, ide)一致）
+                x = torch.rand(1, asg_feature).cuda()        # x维度=asg_feature（删除错误的+6）
+                view = torch.rand(1, 3).cuda()               # view固定3维（和网络forward中拼接逻辑匹配）
+                normal = torch.rand(1, 3).cuda()             # normal固定3维
+                ide = torch.rand(1, ide_dim).cuda()          # ide维度=72（网络默认）
+
+                # 3. 传入所有参数的元组进行trace（原代码只传了x，缺少3个参数）
+                specular_mlp = torch.jit.trace(self.mlp_specular, (x, view, normal, ide))
+                # ========== 关键修正结束 ==========
                 specular_mlp.save(os.path.join(path, 'specular_mlp.pt'))
                 self.mlp_specular.train()
 
@@ -1059,25 +1078,25 @@ class GaussianModel:
                     'color_mlp': self.mlp_color.state_dict(),
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
                     'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path))
+                    }, os.path.join(path, 'checkpoints.pth'))
             elif self.appearance_dim > 0:
                 torch.save({
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
                     'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path))
+                    }, os.path.join(path, 'checkpoints.pth'))
             else:
                 torch.save({
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
-                    }, os.path.join(path))
+                    }, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
 
 
-    def load_mlp_checkpoints(self, path, mode = 'unite'):#split or unite
+    def load_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         if mode == 'split':
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
@@ -1095,7 +1114,7 @@ class GaussianModel:
                 self.mlp_roughness = torch.jit.load(os.path.join(path, 'roughness_mlp.pt')).cuda()
                 self.mlp_specular = torch.jit.load(os.path.join(path, 'specular_mlp.pt')).cuda()
         elif mode == 'unite':
-            checkpoint = torch.load(os.path.join(path))
+            checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
             self.mlp_color.load_state_dict(checkpoint['color_mlp'])

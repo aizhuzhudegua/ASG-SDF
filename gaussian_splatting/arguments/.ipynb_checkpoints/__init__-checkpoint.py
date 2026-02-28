@@ -64,7 +64,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.lod = 0
 
-        self.appearance_dim = 32
+        self.appearance_dim = 0
         self.lowpoly = False
         self.ds = 1
         self.ratio = 1 # sampling the input point cloud
@@ -80,7 +80,7 @@ class ModelParams(ParamGroup):
         self.ref = True
         self.deg_view = 5
         self.enable_idiv_iter = 5000
-        self.enable_ref_iter = 200
+        self.enable_ref_iter = 30000
 
         super().__init__(parser, "Loading Parameters", sentinel)
 

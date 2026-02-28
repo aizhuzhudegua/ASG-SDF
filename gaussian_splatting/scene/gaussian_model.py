@@ -13,70 +13,24 @@ import torch
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func
+from gaussian_splatting.utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
 from torch.utils.cpp_extension import load
-from utils.system_utils import mkdir_p
+from gaussian_splatting.utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
-from utils.ref_utils import generate_ide_fn
-from scene.embedding import Embedding
-from utils.spec_utils import AnchorSpecularNetwork
-import nvdiffrast.torch
+from gaussian_splatting.utils.graphics_utils import BasicPointCloud
+from gaussian_splatting.utils.general_utils import strip_symmetric, build_scaling_rotation
+from gaussian_splatting.utils.ref_utils import generate_ide_fn
+from gaussian_splatting.scene.embedding import Embedding
+from gaussian_splatting.utils.spec_utils import AnchorSpecularNetwork
+
 
 TINT_ROUGH_SEP = True
 HYBRID_IMP_2 = False
 
-class SphMipEncoding(nn.Module):
-    def __init__(
-        self,
-        n_levels: int = 8,
-        plane_size: int = 512,
-        feature_dim: int = 16,
-        Sn: int = 1,
-        dim: int = 1,
-        rand_init: bool = False
-    ):
-        super(SphMipEncoding, self).__init__()
-        self.n_levels = n_levels
-        self.plane_size = plane_size
-        
-        self.register_parameter("fm", nn.Parameter(torch.zeros(Sn, dim, plane_size, 2*plane_size, feature_dim)),)
-        
-        if rand_init:
-            self.init_parameters()
 
-    def init_parameters(self) -> None:
-        nn.init.uniform_(self.fm, -1e-2, 1e-2)
-        
-    def forward(self, x, level, index=0, weight=False):
-        """
-        x: [0,1], Nx3
-        level: [0, max_level], Nx1
-        """
-        x[..., 0] = x[..., 0] * 0.5 + 0.25
-        
-        decomposed_x = x
-        
-        level = torch.broadcast_to(level, decomposed_x.shape[:3]).contiguous()
-        
-        fm = self.fm[index]  # [N, L, 2L, feat_dim]
-        
-        padding_fm = torch.cat([fm[:, :, self.plane_size:, :], fm, fm[:, :, :self.plane_size, :]], dim=2)
-        
-        enc = nvdiffrast.torch.texture(
-            padding_fm,
-            decomposed_x,
-            mip_level_bias=level*self.n_levels,
-            boundary_mode="clamp",
-            max_mip_level=self.n_levels - 1,
-        )
-        
-        enc = (enc.permute(1, 2, 0, 3).contiguous().view(x.shape[0], -1,))
-        return enc
 
 class GaussianModel:
 
@@ -761,8 +715,16 @@ class GaussianModel:
         return optimizable_tensors
 
 
-    # statis grad information to guide liftting. 
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
+     # statis grad information to guide liftting. 
+    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask, grad_threshold=0.0002):
+        # if xyz_sdf != None:
+        #     def simple_sdf_activate(x, sigma=0.01):
+        #         # return 1/torch.log(x.abs()+1)
+
+        #         return torch.exp(-x**2/sigma)
+            # def sdf_activate(x):
+            #     return torch.clamp(0.05/torch.log(x.abs()+1), max = 0.5) * grad_threshold
+                # return 0.002/(1+torch.exp(x.abs()))
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -779,21 +741,30 @@ class GaussianModel:
         combined_mask[anchor_visible_mask] = offset_selection_mask
         temp_mask = combined_mask.clone()
         combined_mask[temp_mask] = update_filter
-        
-        grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        # import pdb;pdb.set_trace()
+        # if xyz_sdf is not None:
+        #     # sdf_activated = sdf_activate(xyz_sdf.unsqueeze(dim=-1))
+        #     sdf_activated = simple_sdf_activate(xyz_sdf.unsqueeze(dim=-1))
+        #     # grad = (viewspace_point_tensor.grad + torch.clamp(0.00005*sdf_activated, max = 10*grad_threshold))[update_filter,:2]
+        #     # import pdb;pdb.set_trace()
+        #     grad = (viewspace_point_tensor.grad)[update_filter,:2]
+
+
+        #     # grad = (viewspace_point_tensor.grad + torch.clamp(0.05*sdf_activated, max = 0.5) * grad_threshold)[update_filter,:2]
+        # else:
+        grad = (viewspace_point_tensor.grad)[update_filter,:2]
+        # grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        grad_norm = torch.norm(grad, dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
-
-        
-
+        # import pdb;pdb.set_trace()
+        # if xyz_sdf is not None:
+        #     self.offset_sdf_accum[combined_mask] += anchor_sdf[update_filter] # .unsqueeze(dim=-1)
         
     def _prune_anchor_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if  'mlp' in group['name'] or \
-                'conv' in group['name'] or \
-                'feat_base' in group['name'] or \
-                'embedding' in group['name']:
+            if 'mlp' in group['name'] or 'conv' in group['name'] or 'feat_base' in group['name']:
                 continue
 
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -934,15 +905,31 @@ class GaussianModel:
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def adjust_anchor(self, extent, add_contents=None, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, xyz_sdf=None, anchor_sdf=None, inside_box=None, anchor_inside_box=None, growing_weight=0.0002):
+        
+        if xyz_sdf!=None:
+            # Activate function (Gaussian) for sdf. 
+            def simple_sdf_activate(x, sigma=0.01):
+                return torch.exp(-x**2/sigma)
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
+
         grads_norm = torch.norm(grads, dim=-1)
+        
+        if xyz_sdf is not None:
+            xyz_sdf_activated = simple_sdf_activate(xyz_sdf)
+            xyz_sdf_activated[~inside_box] = 0.0
+            grow_alpha = growing_weight # 0.0002
+            print("grow_alpha:", grow_alpha)
+            weight_prune = 1
+            # update the grads_norm according to the sdf value
+            grads_norm  = grads_norm + grow_alpha * xyz_sdf_activated
+           
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
-        
+
         # update offset_denom
         self.offset_denom[offset_mask] = 0
         padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
@@ -956,10 +943,27 @@ class GaussianModel:
                                            device=self.offset_gradient_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
         
-        # # prune anchors
-        prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
+        
+        anchor_opacity_sdf_accum = self.opacity_accum 
+
+        if anchor_sdf is not None:
+            
+            anchor_sdf_activated = simple_sdf_activate(anchor_sdf)
+            anchor_sdf_activated[~anchor_inside_box] = 1
+            padding_length = self.get_anchor.shape[0] - anchor_sdf_activated.shape[0]
+            padding_ones = torch.ones([padding_length]).to(self.get_anchor.device)
+            padded_anchor_sdf_activated = torch.cat([anchor_sdf_activated, padding_ones], dim=0)
+            #update the opacity_accum with the anchor sdf value.
+            anchor_opacity_sdf_accum = self.opacity_accum - weight_prune*self.anchor_demon *(1- padded_anchor_sdf_activated.unsqueeze(dim=1)) 
+
+        prune_mask = (anchor_opacity_sdf_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+
+        scaling_mask= self.get_scaling.max(dim=1).values > 0.1 * extent
+        prune_mask = torch.logical_and(prune_mask, scaling_mask) # [N]
+
+
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
@@ -989,7 +993,7 @@ class GaussianModel:
             self.prune_anchor(prune_mask)
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
-
+        
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))
         if mode == 'split':
